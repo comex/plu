@@ -127,9 +127,9 @@ static void usage() {
     fprintf(stderr, "Usage: plu filename|value options...\n"
                     "Options:\n"
                     "  -s key value    set value\n"
-                    " key             get value\n"
-                    " -w out.plist    write\n"
-                    " -x out.plist    write XML\n"
+                    "  key             get value\n"
+                    "  -w out.plist    write\n"
+                    "  -x out.plist    write XML\n"
                     "\n"
                     " Key example: prop[5].foo\n"
                     " Values written as old-style property lists.\n");
