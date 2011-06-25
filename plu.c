@@ -220,6 +220,8 @@ static void serialize_openstep_recurse(CFPropertyListRef plist, CFStringRef inde
                 CFStringAppend(output, CFSTR("\\\""));
             else if(ch == '\0')
                 CFStringAppend(output, CFSTR("\\0"));
+            else if(ch == '\n')
+                CFStringAppend(output, CFSTR("\\n"));
             else
                 CFStringAppendCharacters(output, &ch, 1);
         }
