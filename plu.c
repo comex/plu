@@ -1,13 +1,19 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <unistd.h>
 
 static void show(FILE *fp, CFTypeRef object) {
     CFShow(object);
 }
 
-static bool dots(void *object, char *expr, void **out) {
-    bool set = *out != NULL;
+enum {
+    MODE_GET,
+    MODE_SET,
+    MODE_REMOVE
+};
+
+static bool dots(void *object, char *expr, int mode, void *out) {
     char type = '.';
     char *eos = expr + strlen(expr);
     while(1) {
@@ -42,23 +48,23 @@ static bool dots(void *object, char *expr, void **out) {
             break;
         case 0:
         case '-':
-            if(set) {
-                fprintf(stderr, "Nothing will come of nothing.\n");
-                return false;
-            } else {
-                *out = object;
+            if(mode == MODE_GET) {
+                *((void **) out) = object;
                 return true;
+            } else {
+                fprintf(stderr, "Nothing will come of nothing; try again.\n");
+                return false;
             }
         default:
             fprintf(stderr, "Syntax error: %c %s\n", type, expr);
             return false;
         }
 
-        bool set_now = set && next_type == 0;
+        bool set_now = next_type == 0;
         CFTypeID cftype = CFGetTypeID(object);
         if(cftype == CFArrayGetTypeID()) {
             long long l;
-            if(set && *expr == 0) {
+            if(mode == MODE_SET && *expr == 0) {
                 l = CFArrayGetCount(object);
             } else {
                 errno = 0;
@@ -72,18 +78,21 @@ static bool dots(void *object, char *expr, void **out) {
             }
 
             long long count = (long long) CFArrayGetCount(object);
-            if(l < 0 || (set ? (l > count) : (l >= count))) {
+            if(l < 0 || (mode == MODE_SET ? (l > count) : (l >= count))) {
                 show(stderr, object);
                 fprintf(stderr, "Out of range: %lld\n", l);
                 return false;
             }
 
-            if(set_now) {
+            if(set_now && mode == MODE_SET) {
                 if(l == count) {
-                    CFArrayAppendValue(object, *out);
+                    CFArrayAppendValue(object, out);
                 } else {
-                    CFArraySetValueAtIndex(object, (CFIndex) l, *out);
+                    CFArraySetValueAtIndex(object, (CFIndex) l, out);
                 }
+                return true;
+            } else if(set_now && mode == MODE_REMOVE) {
+                CFArrayRemoveValueAtIndex(object, (CFIndex) l); 
                 return true;
             } else {
                 object = (void *) CFArrayGetValueAtIndex(object, (CFIndex) l);
@@ -95,8 +104,12 @@ static bool dots(void *object, char *expr, void **out) {
                 return false;
             }
 
-            if(set_now) {
-                CFDictionarySetValue(object, str, *out);
+            if(set_now && mode == MODE_SET) {
+                CFDictionarySetValue(object, str, out);
+                CFRelease(str);
+                return true;
+            } else if(set_now && mode == MODE_REMOVE) {
+                CFDictionaryRemoveValue(object, str);
                 CFRelease(str);
                 return true;
             } else {
@@ -128,11 +141,12 @@ static void usage() {
                     "Options:\n"
                     "  -s key value    set value\n"
                     "  key             get value\n"
+                    "  -r key          remove value\n"
                     "  -w out.plist    write\n"
                     "  -x out.plist    write XML\n"
                     "\n"
                     " Key example: prop[5].foo\n"
-                    " Values written as old-style property lists.\n");
+                    " Values should be written as old-style property lists.\n");
     exit(1);
 }
 
@@ -178,6 +192,132 @@ static CFURLRef filename_to_url(const char *filename) {
     return url;
 }
 
+static void serialize_openstep_recurse(CFPropertyListRef plist, CFStringRef indent, CFMutableStringRef output) {
+    CFTypeID type = CFGetTypeID(plist);
+    if(type == CFDataGetTypeID()) {
+        CFStringAppend(output, CFSTR("<"));
+        CFDataRef data = plist;
+        const UInt8 *bytes = CFDataGetBytePtr(data);
+        CFIndex length = CFDataGetLength(data);
+        for(CFIndex i = 0; i < length; i++) {
+            CFStringAppendFormat(output, NULL, CFSTR("%02x"), bytes[i]);
+        }
+        CFStringAppend(output, CFSTR(">"));
+        return;
+    }
+    if(type == CFStringGetTypeID()) {
+        CFStringAppend(output, CFSTR("\""));
+
+        CFStringRef string = plist;
+        CFIndex length = CFStringGetLength(string);
+        UniChar *buffer = malloc(sizeof(*buffer) * length);
+        CFStringGetCharacters(string, CFRangeMake(0, length), buffer);
+        for(CFIndex i = 0; i < length; i++) {
+            UniChar ch = buffer[i];
+            if(ch == '\\')
+                CFStringAppend(output, CFSTR("\\\\"));
+            else if(ch == '"')
+                CFStringAppend(output, CFSTR("\\\""));
+            else if(ch == '\0')
+                CFStringAppend(output, CFSTR("\\0"));
+            else
+                CFStringAppendCharacters(output, &ch, 1);
+        }
+        free(buffer);
+        
+        CFStringAppend(output, CFSTR("\""));
+        return;
+    }
+    if(type == CFNumberGetTypeID()) {
+        CFNumberRef number = plist;
+        long long ll;
+        double d;
+        if(CFNumberGetValue(number, kCFNumberLongLongType, &ll)) {
+            CFStringAppendFormat(output, NULL, CFSTR("%lld"), ll);
+            return;
+        } else if(CFNumberGetValue(number, kCFNumberDoubleType, &d)) {
+            CFStringAppendFormat(output, NULL, CFSTR("%f"), d);
+            return;
+        }
+    }
+    CFStringRef indent2 = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@   "), indent);
+    if(type == CFArrayGetTypeID()) {
+        CFStringAppend(output, CFSTR("(\n"));
+        CFArrayRef array = plist;
+        CFIndex count = CFArrayGetCount(array);
+        for(CFIndex i = 0; i < count; i++) {
+            CFStringAppend(output, indent2);
+            serialize_openstep_recurse(CFArrayGetValueAtIndex(array, i), indent2, output);
+            CFStringAppend(output, CFSTR(",\n"));
+        }
+        CFStringAppend(output, indent);
+        CFStringAppend(output, CFSTR(")"));
+        CFRelease(indent2);
+        return;
+    }
+    if(type == CFDictionaryGetTypeID()) {
+        CFStringAppend(output, CFSTR("{\n"));
+
+        CFDictionaryRef dict = plist;
+        CFIndex count = CFDictionaryGetCount(dict);
+        const void **keys = malloc(sizeof(*keys) * count);
+        const void **values = malloc(sizeof(*keys) * count);
+        CFDictionaryGetKeysAndValues(dict, keys, values);
+        for(CFIndex i = 0; i < count; i++) {
+            CFStringAppend(output, indent2);
+            serialize_openstep_recurse(keys[i], indent2, output);
+            CFStringAppend(output, CFSTR(" = "));
+            serialize_openstep_recurse(values[i], indent2, output);
+            CFStringAppend(output, CFSTR(";\n"));
+        }
+        free(keys);
+        free(values);
+        CFStringAppend(output, indent);
+        CFStringAppend(output, CFSTR("}"));
+        CFRelease(indent2);
+        return;
+    }
+    // some other object
+    CFRelease(indent2);
+    CFStringAppend(output, CFCopyDescription(plist));
+}
+
+static CFDataRef serialize_openstep(CFPropertyListRef plist) {
+    CFMutableStringRef string = CFStringCreateMutable(NULL, 0);
+    serialize_openstep_recurse(plist, CFSTR(""), string);
+    CFStringAppend(string, CFSTR("\n"));
+    CFDataRef result = CFStringCreateExternalRepresentation(NULL, string, kCFStringEncodingUTF8, '?');
+    CFRelease(string);
+    return result;
+}
+
+
+static void write_it(CFPropertyListRef plist, const char *urlname, CFURLRef url, CFPropertyListFormat format) {
+    CFErrorRef cferror;
+    CFDataRef data;
+
+    if(format == kCFPropertyListOpenStepFormat) {
+        data = serialize_openstep(plist);
+    } else {
+        data = CFPropertyListCreateData(NULL, plist, format, 0, &cferror);
+        if(!data) {
+            fprintf(stderr, "Couldn't create data: %s\n", cferror_to_string(cferror));
+            exit(1);
+        }
+    }
+   
+    if(url) {
+        SInt32 error;
+        if(!CFURLWriteDataAndPropertiesToResource(url, data, NULL, &error)) {
+            fprintf(stderr, "Couldn't write %s: %s\n", urlname, urlerror_to_str(error));
+            exit(1);
+        }
+        CFRelease(url);
+    } else {
+        write(1, CFDataGetBytePtr(data), CFDataGetLength(data));
+    }
+    CFRelease(data);
+}
 
 int main(int argc, char **argv) {
     char *filename = argv[1];
@@ -221,6 +361,8 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    bool wrote = false;
+
     char **argptr = &argv[2];
     while(*argptr) {
         if(!strcmp(*argptr, "-s")) {
@@ -239,50 +381,43 @@ int main(int argc, char **argv) {
                 exit(1);
             }
 
-            if(!dots((void *) plist, key, (void *) &valuepl)) exit(1);
+            if(!dots((void *) plist, key, MODE_SET, (void *) valuepl)) exit(1);
 
             CFRelease(data);
             CFRelease(valuepl);
 
             argptr += 3;
-        } else if(!strcmp(*argptr, "-w") || !strcmp(*argptr, "-x")) {
-            if((*argptr)[1] == 'x') {
-                format = kCFPropertyListXMLFormat_v1_0;
-            }
-
+        } else if(!strcmp(*argptr, "-r")) {
             if(!argptr[1]) usage();
-            CFURLRef url2 = strcmp(argptr[1], "-") ? filename_to_url(argptr[1]) : NULL;
+            char *key = argptr[1];
 
-            if(format == kCFPropertyListOpenStepFormat) {
-                fprintf(stderr, "Note: converting OpenStep format to XML\n");
+            if(!dots((void *) plist, key, MODE_REMOVE, NULL)) exit(1);
+
+            argptr += 2;
+        } else if(!strcmp(*argptr, "-w") || !strcmp(*argptr, "-x") || !strcmp(*argptr, "-o")) {
+            if(!argptr[1]) usage();
+            char mode = (*argptr)[1];
+            if(mode == 'x')
                 format = kCFPropertyListXMLFormat_v1_0;
-            }
-            CFDataRef data = CFPropertyListCreateData(NULL, plist, format, 0, &cferror);
-            if(!data) {
-                fprintf(stderr, "Couldn't create data: %s\n", cferror_to_string(cferror));
-                exit(1);
-            }
-           
-            if(url2) {
-                SInt32 error;
-                if(!CFURLWriteDataAndPropertiesToResource(url2, data, NULL, &error)) {
-                    fprintf(stderr, "Couldn't write %s: %s\n", argptr[1], urlerror_to_str(error));
-                    exit(1);
-                }
-                CFRelease(url2);
-            } else {
-                write(1, CFDataGetBytePtr(data), CFDataGetLength(data));
-            }
-            CFRelease(data);
+            else if(mode == 'o')
+                format = kCFPropertyListOpenStepFormat;
+            CFURLRef url2 = strcmp(argptr[1], "-") ? filename_to_url(argptr[1]) : NULL;
+            write_it(plist, argptr[1], url2, format);
 
+            wrote = true;
             argptr += 2;
         } else {
             void *out = NULL;
-            if(!dots((void *) plist, *argptr, &out)) exit(1);
+            if(!dots((void *) plist, *argptr, MODE_GET, &out)) exit(1);
             show(stdout, out);
 
             argptr++;
         }
     }
+
+    if(!wrote) {
+        write_it(plist, "-", NULL, kCFPropertyListOpenStepFormat);
+    }
+
     return 0;
 }
